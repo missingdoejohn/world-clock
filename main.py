@@ -6,7 +6,7 @@ import traceback
 import os
 
 # ===== CONFIG =====
-TOKEN =("")  # for Railway
+TOKEN =os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1485035815024197805
 
 # ===== BOT SETUP =====
