@@ -5,9 +5,12 @@ from zoneinfo import ZoneInfo
 import traceback
 import os
 
-# ===== CONFIG =====
-TOKEN =os.getenv("DISCORD_TOKEN")
+# ===== CONFIG (RAILWAY SAFE) =====
+TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1485035815024197805
+
+if not TOKEN:
+    raise Exception("❌ DISCORD_TOKEN not set in Railway Variables")
 
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
