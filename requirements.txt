@@ -1,2 +1,2 @@
-discord.py
-requests
+discord.py==2.7.1
+holidays>=0.47
