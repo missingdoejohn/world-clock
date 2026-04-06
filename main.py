@@ -347,13 +347,11 @@ def build_today_holiday_lines(region_locations: list[dict[str, str]]) -> list[st
         seen_country_codes.add(country_code)
         country = COUNTRIES[country_code]
         today_holidays = get_today_holidays(country_code)
+        if not today_holidays:
+            continue
+
         holiday_emoji = get_holiday_emoji(today_holidays)
-
-        if today_holidays:
-            holiday_text = " / ".join(today_holidays)
-        else:
-            holiday_text = "No public holiday today"
-
+        holiday_text = " / ".join(today_holidays)
         lines.append(f"{country['flag']} {holiday_emoji} {holiday_text}")
 
     return lines
@@ -409,8 +407,6 @@ def build_embed():
             inline=False,
         )
 
-    embed.set_footer(text="Updates every 30 minutes | !time <city> | !holidays <country>")
-    embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 
