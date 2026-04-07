@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Iterable
@@ -31,6 +32,7 @@ def read_int_env(*names: str, default: int) -> int:
 
 
 TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN") or "").strip()
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
 CHANNEL_ID = read_int_env(
     "MEME_MARKET_CHANNEL_ID",
     "WORLD_CLOCK_CHANNEL_ID",
@@ -49,6 +51,13 @@ HOT_TOKEN_SCORE = 60
 EMBED_TITLE = "Global Meme Desk"
 LEGACY_EMBED_TITLES = {EMBED_TITLE, "Meme Market Watch", "World Clock"}
 REFERENCE_TZ_NAME = os.getenv("DESK_REFERENCE_TZ", "America/Phoenix").strip() or "America/Phoenix"
+BIRDEYE_API_BASE_URL = "https://public-api.birdeye.so"
+BIRDEYE_MAX_ADDRESS_BATCH = 20
+BIRDEYE_MAX_MEME_LIST_LIMIT = 100
+BIRDEYE_REFRESH_MINUTES = max(5, min(60, read_int_env("BIRDEYE_REFRESH_MINUTES", default=10)))
+BIRDEYE_COOLDOWN_MINUTES = max(5, min(180, read_int_env("BIRDEYE_COOLDOWN_MINUTES", default=30)))
+BIRDEYE_MAX_ENRICH_TOKENS = max(1, min(10, read_int_env("BIRDEYE_MAX_ENRICH_TOKENS", default=5)))
+BIRDEYE_ENABLE_MULTI = os.getenv("BIRDEYE_ENABLE_MULTI", "").strip().lower() in {"1", "true", "yes", "on"}
 
 DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 DEX_TOKENS_BY_ADDRESS_URL = "https://api.dexscreener.com/tokens/v1/solana/{}"
@@ -56,6 +65,9 @@ DEX_TOKEN_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEX_TOKEN_BOOSTS_LATEST_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
 DEX_TOKEN_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 DEX_COMMUNITY_TAKEOVERS_URL = "https://api.dexscreener.com/community-takeovers/latest/v1"
+BIRDEYE_MEME_LIST_URL = f"{BIRDEYE_API_BASE_URL}/defi/v3/token/meme/list"
+BIRDEYE_MARKET_DATA_MULTIPLE_URL = f"{BIRDEYE_API_BASE_URL}/defi/v3/token/market-data/multiple"
+BIRDEYE_TRADE_DATA_MULTIPLE_URL = f"{BIRDEYE_API_BASE_URL}/defi/v3/token/trade-data/multiple"
 
 DISCOVERY_SEARCH_TERMS = ("solana", "meme", "pump", "bonk", "dog")
 SOL_CA_REGEX = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
@@ -98,6 +110,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 http_session: aiohttp.ClientSession | None = None
 message_id = INITIAL_MESSAGE_ID
+birdeye_meme_cache: tuple[float, dict[str, dict[str, Any]]] = (0.0, {})
+birdeye_market_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+birdeye_trade_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+birdeye_meme_disabled_until = 0.0
+birdeye_multi_disabled_until = 0.0
 
 
 def safe_float(value: Any) -> float:
@@ -121,6 +138,10 @@ def average(values: Iterable[float]) -> float:
     return sum(numbers) / len(numbers)
 
 
+def now_ts() -> float:
+    return time.time()
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -142,6 +163,37 @@ def normalize_items(data: Any) -> list[dict[str, Any]]:
     return []
 
 
+def iter_dict_records(payload: Any) -> Iterable[dict[str, Any]]:
+    seen: set[int] = set()
+    queue: list[Any] = [payload]
+
+    while queue:
+        current = queue.pop(0)
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+
+        if isinstance(current, list):
+            for item in current:
+                if isinstance(item, dict):
+                    yield item
+                    queue.append(item)
+                elif isinstance(item, list):
+                    queue.append(item)
+            continue
+
+        if not isinstance(current, dict):
+            continue
+
+        if current:
+            yield current
+
+        for value in current.values():
+            if isinstance(value, (dict, list)):
+                queue.append(value)
+
+
 def chunked(values: list[str], size: int) -> Iterable[list[str]]:
     for index in range(0, len(values), size):
         yield values[index:index + size]
@@ -156,6 +208,101 @@ def iter_locations():
 CITY_LOOKUP = {
     normalize_text(location["city"]): location for _, location in iter_locations()
 }
+
+
+def get_record_address(record: dict[str, Any]) -> str:
+    for value in (
+        record.get("address"),
+        record.get("tokenAddress"),
+        record.get("token_address"),
+        record.get("mint"),
+        record.get("baseAddress"),
+        (record.get("token") or {}).get("address") if isinstance(record.get("token"), dict) else None,
+        (record.get("baseToken") or {}).get("address") if isinstance(record.get("baseToken"), dict) else None,
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def get_nested_value(container: Any, path: tuple[str, ...]) -> Any:
+    current = container
+    for part in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def pick_number(container: dict[str, Any], *paths: str | tuple[str, ...]) -> float | None:
+    for path in paths:
+        value = container.get(path) if isinstance(path, str) else get_nested_value(container, path)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def pick_int(container: dict[str, Any], *paths: str | tuple[str, ...]) -> int | None:
+    for path in paths:
+        value = container.get(path) if isinstance(path, str) else get_nested_value(container, path)
+        if value in (None, ""):
+            continue
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def blend_metric(primary: float, secondary: float | None, *, primary_weight: float = 0.55) -> float:
+    if secondary is None or secondary <= 0:
+        return primary
+    if primary <= 0:
+        return secondary
+    return (primary * primary_weight) + (secondary * (1.0 - primary_weight))
+
+
+def birdeye_refresh_seconds() -> float:
+    return float(BIRDEYE_REFRESH_MINUTES * 60)
+
+
+def is_cache_fresh(cached_at: float, ttl_seconds: float) -> bool:
+    return cached_at > 0 and (now_ts() - cached_at) < ttl_seconds
+
+
+def is_birdeye_mode_available(mode: str) -> bool:
+    if not BIRDEYE_API_KEY:
+        return False
+
+    if mode == "meme":
+        return now_ts() >= birdeye_meme_disabled_until
+    if mode == "multi":
+        return BIRDEYE_ENABLE_MULTI and now_ts() >= birdeye_multi_disabled_until
+    return False
+
+
+def set_birdeye_cooldown(mode: str, reason: str) -> None:
+    global birdeye_meme_disabled_until, birdeye_multi_disabled_until
+
+    until = now_ts() + (BIRDEYE_COOLDOWN_MINUTES * 60)
+    if mode == "meme":
+        birdeye_meme_disabled_until = until
+    elif mode == "multi":
+        birdeye_multi_disabled_until = until
+    elif mode == "all":
+        birdeye_meme_disabled_until = until
+        birdeye_multi_disabled_until = until
+
+    logger.warning(
+        "Birdeye %s cooldown for %s minutes: %s",
+        mode,
+        BIRDEYE_COOLDOWN_MINUTES,
+        reason,
+    )
 
 
 def is_valid_solana_ca(value: str) -> bool:
@@ -322,17 +469,33 @@ async def ensure_http_session() -> aiohttp.ClientSession:
     return http_session
 
 
-async def fetch_json(url: str, *, params: dict[str, str] | None = None) -> Any:
+def get_birdeye_headers() -> dict[str, str]:
+    return {
+        "User-Agent": "Codex Meme Market Watcher",
+        "Accept": "application/json",
+        "X-API-KEY": BIRDEYE_API_KEY,
+        "x-chain": "solana",
+    }
+
+
+async def fetch_json(
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
     session = await ensure_http_session()
-    headers = {
+    request_headers = {
         "User-Agent": "Codex Meme Market Watcher",
         "Accept": "application/json",
     }
+    if headers:
+        request_headers.update(headers)
 
     last_error: Exception | None = None
     for attempt in range(1, MAX_HTTP_RETRIES + 1):
         try:
-            async with session.get(url, params=params, headers=headers) as response:
+            async with session.get(url, params=params, headers=request_headers) as response:
                 if response.status == 429:
                     await asyncio.sleep(float(attempt))
                     continue
@@ -349,6 +512,28 @@ async def fetch_json(url: str, *, params: dict[str, str] | None = None) -> Any:
             await asyncio.sleep(min(2**attempt, 6))
 
     raise RuntimeError(f"Request failed for {url}") from last_error
+
+
+async def fetch_birdeye_json(
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+    mode: str = "meme",
+) -> Any:
+    if not is_birdeye_mode_available(mode):
+        return None
+
+    try:
+        return await fetch_json(url, params=params, headers=get_birdeye_headers())
+    except RuntimeError as exc:
+        message = str(exc)
+        if "HTTP 429" in message:
+            set_birdeye_cooldown("all", message)
+            return None
+        if "HTTP 403" in message or "HTTP 401" in message:
+            set_birdeye_cooldown(mode, message)
+            return None
+        raise
 
 
 async def fetch_search_pairs(query: str) -> list[dict[str, Any]]:
@@ -372,6 +557,268 @@ def extract_addresses_from_payload(
             continue
 
         address_sources[token_address].add(source_name)
+
+
+async def fetch_birdeye_meme_candidates() -> dict[str, dict[str, Any]]:
+    global birdeye_meme_cache
+
+    cached_at, cached_records = birdeye_meme_cache
+    if is_cache_fresh(cached_at, birdeye_refresh_seconds()):
+        return cached_records
+
+    if not is_birdeye_mode_available("meme"):
+        return cached_records
+
+    query_variants = (
+        {
+            "sort_by": "volume_5m_usd",
+            "sort_type": "desc",
+            "min_liquidity": "5000",
+            "min_volume_5m_usd": "1000",
+            "offset": "0",
+            "limit": str(BIRDEYE_MAX_MEME_LIST_LIMIT),
+        },
+        {
+            "sort_by": "trade_5m_count",
+            "sort_type": "desc",
+            "min_liquidity": "5000",
+            "offset": "0",
+            "limit": str(BIRDEYE_MAX_MEME_LIST_LIMIT),
+        },
+    )
+
+    results = await asyncio.gather(
+        *(fetch_birdeye_json(BIRDEYE_MEME_LIST_URL, params=params, mode="meme") for params in query_variants),
+        return_exceptions=True,
+    )
+
+    records_by_address: dict[str, dict[str, Any]] = {}
+    for result in results:
+        if isinstance(result, Exception):
+            logger.exception("Birdeye meme discovery failed: %s", result)
+            continue
+
+        for record in iter_dict_records(result):
+            address = get_record_address(record)
+            if not is_valid_solana_ca(address):
+                continue
+
+            existing = records_by_address.get(address, {})
+            merged = dict(existing)
+            merged.update(record)
+            records_by_address[address] = merged
+
+    if records_by_address:
+        birdeye_meme_cache = (now_ts(), records_by_address)
+        return records_by_address
+
+    return cached_records
+
+async def fetch_birdeye_token_data(
+    addresses: list[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    if not is_birdeye_mode_available("multi"):
+        return {}, {}
+
+    unique_addresses = [address for address in dict.fromkeys(addresses) if address][:BIRDEYE_MAX_ENRICH_TOKENS]
+    market_records: dict[str, dict[str, Any]] = {}
+    trade_records: dict[str, dict[str, Any]] = {}
+    stale_addresses: list[str] = []
+
+    for address in unique_addresses:
+        cached_market = birdeye_market_cache.get(address)
+        cached_trade = birdeye_trade_cache.get(address)
+
+        if cached_market and is_cache_fresh(cached_market[0], birdeye_refresh_seconds()):
+            market_records[address] = cached_market[1]
+        if cached_trade and is_cache_fresh(cached_trade[0], birdeye_refresh_seconds()):
+            trade_records[address] = cached_trade[1]
+
+        if address not in market_records or address not in trade_records:
+            stale_addresses.append(address)
+
+    if not stale_addresses:
+        return market_records, trade_records
+
+    for batch in chunked(stale_addresses, BIRDEYE_MAX_ADDRESS_BATCH):
+        joined = ",".join(batch)
+        market_params = {"list_address": joined}
+        trade_params = {"list_address": joined}
+
+        market_payload, trade_payload = await asyncio.gather(
+            fetch_birdeye_json(BIRDEYE_MARKET_DATA_MULTIPLE_URL, params=market_params, mode="multi"),
+            fetch_birdeye_json(BIRDEYE_TRADE_DATA_MULTIPLE_URL, params=trade_params, mode="multi"),
+            return_exceptions=True,
+        )
+
+        if not isinstance(market_payload, Exception):
+            for record in iter_dict_records(market_payload):
+                address = get_record_address(record)
+                if address:
+                    existing = market_records.get(address, {})
+                    merged = dict(existing)
+                    merged.update(record)
+                    market_records[address] = merged
+                    birdeye_market_cache[address] = (now_ts(), merged)
+        else:
+            logger.exception("Birdeye market data failed: %s", market_payload)
+
+        if not isinstance(trade_payload, Exception):
+            for record in iter_dict_records(trade_payload):
+                address = get_record_address(record)
+                if address:
+                    existing = trade_records.get(address, {})
+                    merged = dict(existing)
+                    merged.update(record)
+                    trade_records[address] = merged
+                    birdeye_trade_cache[address] = (now_ts(), merged)
+        else:
+            logger.exception("Birdeye trade data failed: %s", trade_payload)
+
+    return market_records, trade_records
+
+
+def enrich_token_with_birdeye(
+    token: dict[str, Any],
+    meme_record: dict[str, Any] | None,
+    market_record: dict[str, Any] | None,
+    trade_record: dict[str, Any] | None,
+) -> None:
+    birdeye_vol_m5 = None
+    birdeye_vol_h1 = None
+    birdeye_vol_h24 = None
+    birdeye_change_m5 = None
+    birdeye_change_h1 = None
+    birdeye_buys = None
+    birdeye_sells = None
+    birdeye_trades = None
+
+    if meme_record:
+        token["birdeye_listed"] = True
+        token["holders"] = max(
+            safe_int(token.get("holders", 0)),
+            safe_int(
+                pick_int(
+                    meme_record,
+                    "holder",
+                    "holders",
+                    "holder_count",
+                    "holderCount",
+                )
+                or 0
+            ),
+        )
+        birdeye_vol_m5 = pick_number(meme_record, "volume_5m_usd", "volume_5m")
+        birdeye_vol_h1 = pick_number(meme_record, "volume_1h_usd", "volume_1h")
+        birdeye_vol_h24 = pick_number(meme_record, "volume_24h_usd", "volume_24h")
+        birdeye_change_m5 = pick_number(meme_record, "price_change_5m_percent", "price_change_5m")
+        birdeye_change_h1 = pick_number(meme_record, "price_change_1h_percent", "price_change_1h")
+        birdeye_trades = pick_int(meme_record, "trade_5m_count", "trades_5m_count", "trade_count_5m")
+
+    if market_record:
+        token["liq"] = blend_metric(
+            token["liq"],
+            pick_number(
+                market_record,
+                "liquidity",
+                "liquidity_usd",
+                ("liquidity", "usd"),
+                ("liquidity", "value"),
+            ),
+            primary_weight=0.6,
+        )
+        token["market_cap"] = blend_metric(
+            token["market_cap"],
+            pick_number(
+                market_record,
+                "market_cap",
+                "marketCap",
+                "mc",
+                ("marketcap", "value"),
+            ),
+            primary_weight=0.65,
+        )
+
+    if trade_record:
+        birdeye_vol_m5 = pick_number(
+            trade_record,
+            "volume_5m_usd",
+            "volume_5m",
+            ("volume", "5m", "usd"),
+            ("volume", "m5", "usd"),
+            ("trade_data", "5m", "volume_usd"),
+        ) or birdeye_vol_m5
+        birdeye_vol_h1 = pick_number(
+            trade_record,
+            "volume_1h_usd",
+            "volume_1h",
+            ("volume", "1h", "usd"),
+            ("trade_data", "1h", "volume_usd"),
+        ) or birdeye_vol_h1
+        birdeye_vol_h24 = pick_number(
+            trade_record,
+            "volume_24h_usd",
+            "volume_24h",
+            ("volume", "24h", "usd"),
+            ("trade_data", "24h", "volume_usd"),
+        ) or birdeye_vol_h24
+        birdeye_change_m5 = pick_number(
+            trade_record,
+            "price_change_5m_percent",
+            "price_change_5m",
+            ("price_change", "5m"),
+            ("trade_data", "5m", "price_change_percent"),
+        ) or birdeye_change_m5
+        birdeye_change_h1 = pick_number(
+            trade_record,
+            "price_change_1h_percent",
+            "price_change_1h",
+            ("price_change", "1h"),
+            ("trade_data", "1h", "price_change_percent"),
+        ) or birdeye_change_h1
+        birdeye_trades = pick_int(
+            trade_record,
+            "trade_5m_count",
+            "trade_count_5m",
+            "trades_5m_count",
+            ("trade_count", "5m"),
+            ("trades", "5m"),
+        ) or birdeye_trades
+        birdeye_buys = pick_int(
+            trade_record,
+            "buy_5m_count",
+            "buys_5m_count",
+            ("buy", "5m", "count"),
+            ("buys", "5m"),
+        )
+        birdeye_sells = pick_int(
+            trade_record,
+            "sell_5m_count",
+            "sells_5m_count",
+            ("sell", "5m", "count"),
+            ("sells", "5m"),
+        )
+
+    token["vol_m5"] = blend_metric(token["vol_m5"], birdeye_vol_m5)
+    token["vol_h1"] = blend_metric(token["vol_h1"], birdeye_vol_h1)
+    token["vol_h24"] = blend_metric(token["vol_h24"], birdeye_vol_h24, primary_weight=0.65)
+
+    if birdeye_change_m5 is not None:
+        token["change_m5"] = blend_metric(token["change_m5"], birdeye_change_m5, primary_weight=0.5)
+    if birdeye_change_h1 is not None:
+        token["change_h1"] = blend_metric(token["change_h1"], birdeye_change_h1, primary_weight=0.55)
+
+    if birdeye_trades is not None and birdeye_trades > 0:
+        token["txns_total"] = int(round(blend_metric(float(token["txns_total"]), float(birdeye_trades), primary_weight=0.55)))
+
+    if birdeye_buys is not None and birdeye_buys > 0:
+        token["buys"] = int(round(blend_metric(float(token["buys"]), float(birdeye_buys), primary_weight=0.55)))
+
+    if birdeye_sells is not None and birdeye_sells >= 0:
+        token["sells"] = int(round(blend_metric(float(token["sells"]), float(birdeye_sells), primary_weight=0.55)))
+
+    token["txns_total"] = max(token["txns_total"], token["buys"] + token["sells"])
+    token["birdeye_hybrid"] = bool(meme_record or market_record or trade_record)
 
 
 async def hydrate_pairs_for_addresses(
@@ -402,8 +849,9 @@ async def hydrate_pairs_for_addresses(
     return hydrated_pairs
 
 
-async def collect_raw_pairs() -> list[dict[str, Any]]:
+async def collect_raw_pairs() -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     raw_pairs: list[dict[str, Any]] = []
+    birdeye_meme_records: dict[str, dict[str, Any]] = {}
 
     search_results = await asyncio.gather(
         *(fetch_search_pairs(query) for query in DISCOVERY_SEARCH_TERMS),
@@ -433,8 +881,12 @@ async def collect_raw_pairs() -> list[dict[str, Any]]:
             continue
         extract_addresses_from_payload(source_name, payload, address_sources)
 
+    birdeye_meme_records = await fetch_birdeye_meme_candidates()
+    for address in birdeye_meme_records:
+        address_sources[address].add("birdeye:meme")
+
     raw_pairs.extend(await hydrate_pairs_for_addresses(address_sources))
-    return raw_pairs
+    return raw_pairs, birdeye_meme_records
 
 
 def parse_pair(pair: dict[str, Any]) -> dict[str, Any] | None:
@@ -487,8 +939,11 @@ def parse_pair(pair: dict[str, Any]) -> dict[str, Any] | None:
         "market_cap": safe_float(pair.get("marketCap")),
         "fdv": safe_float(pair.get("fdv")),
         "boosts_active": safe_int(boosts.get("active")),
+        "holders": 0,
         "social_count": len([item for item in socials if isinstance(item, dict)]),
         "sources": list(pair.get("_sources") or []),
+        "birdeye_listed": False,
+        "birdeye_hybrid": False,
     }
     token["txns_total"] = token["buys"] + token["sells"]
     token["score"] = compute_activity_score(token)
@@ -572,6 +1027,14 @@ def compute_activity_score(token: dict[str, Any]) -> int:
         score += min(token["boosts_active"], 3)
     if token["social_count"] >= 2:
         score += 2
+    if token.get("birdeye_listed"):
+        score += 4
+    if token.get("birdeye_hybrid"):
+        score += 3
+    if token.get("holders", 0) >= 1_000:
+        score += 4
+    elif token.get("holders", 0) >= 250:
+        score += 2
 
     if token["age"] <= 60:
         score += 4
@@ -654,17 +1117,29 @@ def build_market_pulse(tokens: list[dict[str, Any]]) -> dict[str, float | int | 
 
 
 async def fetch_market_snapshot() -> dict[str, Any]:
-    raw_pairs = await collect_raw_pairs()
+    raw_pairs, birdeye_meme_records = await collect_raw_pairs()
 
     best_by_ca: dict[str, dict[str, Any]] = {}
     for pair in raw_pairs:
         token = parse_pair(pair)
-        if token is None or not should_consider_token(token):
+        if token is None:
             continue
         best_by_ca[token["ca"]] = choose_best_token(best_by_ca.get(token["ca"]), token)
 
+    tokens = list(best_by_ca.values())
+    market_records, trade_records = await fetch_birdeye_token_data([token["ca"] for token in tokens])
+
+    for token in tokens:
+        enrich_token_with_birdeye(
+            token,
+            birdeye_meme_records.get(token["ca"]),
+            market_records.get(token["ca"]),
+            trade_records.get(token["ca"]),
+        )
+        token["score"] = compute_activity_score(token)
+
     ranked = sorted(
-        best_by_ca.values(),
+        [token for token in tokens if should_consider_token(token)],
         key=lambda token: (
             token["score"],
             token["vol_m5"],
@@ -703,6 +1178,14 @@ async def fetch_market_snapshot() -> dict[str, Any]:
         "top_gainer": top_gainer,
         "top_flow": top_flow,
         "top_volume": top_volume,
+        "engine": (
+            "DexScreener + Birdeye Hybrid"
+            if BIRDEYE_API_KEY and BIRDEYE_ENABLE_MULTI
+            else "DexScreener + Birdeye Safe"
+            if BIRDEYE_API_KEY
+            else "DexScreener"
+        ),
+        "hybrid_count": sum(1 for token in ranked if token.get("birdeye_hybrid")),
     }
 
 
@@ -723,6 +1206,7 @@ def build_status_block(snapshot: dict[str, Any]) -> str:
                 f"{badge} {label}",
                 "No meme coins are clearing the activity floor right now.",
                 f"Scanned {snapshot['scanned']} live candidates.",
+                f"Engine {snapshot['engine']} | Birdeye refresh {BIRDEYE_REFRESH_MINUTES}m",
             ]
         )
 
@@ -735,6 +1219,10 @@ def build_status_block(snapshot: dict[str, Any]) -> str:
                 f" | buys/sells {safe_int(pulse['total_buys'])}/{safe_int(pulse['total_sells'])}"
             ),
             f"avg score {round(safe_float(pulse['avg_score']))} | avg m5 {format_signed_pct(safe_float(pulse['avg_change_m5']))}",
+            (
+                f"Engine {snapshot['engine']} | hybrid tokens {snapshot['hybrid_count']}"
+                f" | Birdeye refresh {BIRDEYE_REFRESH_MINUTES}m"
+            ),
         ]
     )
 
@@ -750,12 +1238,18 @@ def build_leaders_block(tokens: list[dict[str, Any]]) -> str:
         if pair_url:
             symbol = f"[${token['symbol']}]({pair_url})"
 
+        tail_bits = [f"{token['buys']}/{token['sells']}"]
+        if token.get("holders", 0) > 0:
+            tail_bits.append(f"{safe_int(token['holders'])} holders")
+        if token.get("birdeye_hybrid"):
+            tail_bits.append("hybrid")
+
         lines.append(
             (
                 f"{index}. {token_heat_badge(token['score'])} {symbol} "
                 f"{format_signed_pct(token['change_m5'])} | "
                 f"m5 {format_usd(token['vol_m5'])} | "
-                f"{token['buys']}/{token['sells']}"
+                f"{' | '.join(tail_bits)}"
             )
         )
 
