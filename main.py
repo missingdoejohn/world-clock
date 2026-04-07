@@ -48,8 +48,8 @@ MAX_DISPLAY_TOKENS = 5
 MIN_DISPLAY_SCORE = 28
 ACTIVE_TOKEN_SCORE = 45
 HOT_TOKEN_SCORE = 60
-EMBED_TITLE = "Global Meme Desk"
-LEGACY_EMBED_TITLES = {EMBED_TITLE, "Meme Market Watch", "World Clock"}
+EMBED_TITLE = "Global Desk"
+LEGACY_EMBED_TITLES = {EMBED_TITLE, "Global Meme Desk", "Meme Market Watch", "World Clock"}
 REFERENCE_TZ_NAME = os.getenv("DESK_REFERENCE_TZ", "America/Phoenix").strip() or "America/Phoenix"
 BIRDEYE_API_BASE_URL = "https://public-api.birdeye.so"
 BIRDEYE_MAX_ADDRESS_BATCH = 20
@@ -1292,18 +1292,14 @@ def build_fast_reads_block(snapshot: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_embed(snapshot: dict[str, Any]) -> discord.Embed:
-    pulse = snapshot["pulse"]
+def build_embed() -> discord.Embed:
     embed = discord.Embed(
         title=EMBED_TITLE,
-        description="World clock + live Solana meme market pulse\n🟢 prime • 🟡 shoulder • 🌙 late • 🟣 weekend",
-        color=embed_color_for_label(str(pulse["label"])),
+        description="Live global time desk\n🟢 prime • 🟡 shoulder • 🌙 late • 🟣 weekend",
+        color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
     )
     build_clock_fields(embed)
-    embed.add_field(name="Market Pulse", value=build_status_block(snapshot), inline=False)
-    embed.add_field(name="Heat Board", value=build_leaders_block(snapshot["leaders"]), inline=False)
-    embed.add_field(name="Fast Reads", value=build_fast_reads_block(snapshot), inline=False)
     return embed
 
 
@@ -1326,8 +1322,8 @@ async def find_existing_market_message(channel: Any):
 async def refresh_market_message(*, force_post: bool = False) -> dict[str, Any]:
     global message_id
 
-    snapshot = await fetch_market_snapshot()
-    embed = build_embed(snapshot)
+    snapshot: dict[str, Any] = {}
+    embed = build_embed()
     channel = await get_target_channel()
 
     if message_id and not force_post:
@@ -1376,16 +1372,9 @@ async def before_auto_market():
     await bot.wait_until_ready()
 
 
-@bot.command(name="desk", aliases=["market", "meme", "pulse"])
+@bot.command(name="desk", aliases=["clock"])
 async def market_command(ctx: commands.Context):
-    try:
-        snapshot = await fetch_market_snapshot()
-    except Exception:
-        logger.exception("Manual market refresh failed.")
-        await ctx.send("Could not fetch meme market data right now.")
-        return
-
-    await ctx.send(embed=build_embed(snapshot))
+    await ctx.send(embed=build_embed())
 
 
 @bot.command(name="time")
