@@ -6,7 +6,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
@@ -49,6 +49,9 @@ MAX_DISPLAY_TOKENS = 5
 MIN_DISPLAY_SCORE = 28
 ACTIVE_TOKEN_SCORE = 45
 HOT_TOKEN_SCORE = 60
+HOLIDAY_PREVIEW_COUNT = max(1, min(6, read_int_env("HOLIDAY_PREVIEW_COUNT", default=3)))
+HOLIDAY_COMMAND_LIMIT = max(HOLIDAY_PREVIEW_COUNT, min(20, read_int_env("HOLIDAY_COMMAND_LIMIT", default=12)))
+HOLIDAY_LANGUAGE = "en_US"
 EMBED_TITLE = "Global Desk"
 LEGACY_EMBED_TITLES = {EMBED_TITLE, "Global Meme Desk", "Meme Market Watch", "World Clock"}
 REFERENCE_TZ_NAME = os.getenv("DESK_REFERENCE_TZ", "America/Phoenix").strip() or "America/Phoenix"
@@ -109,6 +112,12 @@ COUNTRY_INFO = {
     "AE": {"flag": "🇦🇪", "name": "United Arab Emirates", "reference_tz": "Asia/Dubai"},
     "IN": {"flag": "🇮🇳", "name": "India", "reference_tz": "Asia/Kolkata"},
     "AU": {"flag": "🇦🇺", "name": "Australia", "reference_tz": "Australia/Sydney"},
+}
+
+SUPPLEMENTAL_HOLIDAYS = {
+    "*": {
+        (4, 22): ("Earth Day",),
+    },
 }
 
 if not TOKEN:
@@ -219,6 +228,31 @@ def iter_locations():
 CITY_LOOKUP = {
     normalize_text(location["city"]): location for _, location in iter_locations()
 }
+
+COUNTRY_LOOKUP = {
+    normalize_text(info["name"]): country_code for country_code, info in COUNTRY_INFO.items()
+}
+COUNTRY_LOOKUP.update(
+    {
+        "us": "US",
+        "usa": "US",
+        "united states of america": "US",
+        "uk": "GB",
+        "britain": "GB",
+        "great britain": "GB",
+        "england": "GB",
+        "fr": "FR",
+        "france": "FR",
+        "jp": "JP",
+        "japan": "JP",
+        "uae": "AE",
+        "united arab emirates": "AE",
+        "in": "IN",
+        "india": "IN",
+        "au": "AU",
+        "australia": "AU",
+    }
+)
 
 
 def get_record_address(record: dict[str, Any]) -> str:
@@ -393,6 +427,26 @@ def resolve_location(query: str):
     return None
 
 
+def resolve_country_query(query: str) -> str | None:
+    normalized_query = normalize_text(query)
+
+    if normalized_query in CITY_LOOKUP:
+        return CITY_LOOKUP[normalized_query]["country_code"]
+
+    if normalized_query in COUNTRY_LOOKUP:
+        return COUNTRY_LOOKUP[normalized_query]
+
+    for city, location in CITY_LOOKUP.items():
+        if normalized_query in city:
+            return location["country_code"]
+
+    for country_name, country_code in COUNTRY_LOOKUP.items():
+        if normalized_query in country_name:
+            return country_code
+
+    return None
+
+
 def get_city_status_emoji(now: datetime) -> str:
     hour = now.hour
 
@@ -440,9 +494,6 @@ def build_clock_block(locations: list[dict[str, str]], reference_now: datetime) 
 
 
 def format_holiday_name(name: Any) -> str:
-    if isinstance(name, (list, tuple, set)):
-        name = " / ".join(str(part) for part in name)
-
     text = str(name)
     text = text.replace(" (Observed)", "").replace(" (observed)", "")
     text = text.replace(" (Estimated)", "").replace(" (estimated)", "")
@@ -454,7 +505,11 @@ def get_country_today(country_code: str):
 
 
 def get_country_calendar(country_code: str, years: list[int]):
-    base_calendar = holidays.country_holidays(country_code, years=years)
+    base_calendar = holidays.country_holidays(
+        country_code,
+        years=years,
+        language=HOLIDAY_LANGUAGE,
+    )
     supported_categories = getattr(base_calendar, "supported_categories", None)
 
     if supported_categories:
@@ -462,33 +517,29 @@ def get_country_calendar(country_code: str, years: list[int]):
             country_code,
             years=years,
             categories=supported_categories,
+            language=HOLIDAY_LANGUAGE,
         )
 
     return base_calendar
 
 
-def get_today_holidays(country_code: str) -> list[str]:
-    today = get_country_today(country_code)
-
-    try:
-        calendar = get_country_calendar(country_code, [today.year])
-    except Exception:
-        logger.exception("Could not load holiday calendar for %s", country_code)
+def split_holiday_names(value: Any) -> list[str]:
+    if value in (None, ""):
         return []
 
-    holiday_names = calendar.get(today)
-    if not holiday_names:
-        return []
-
-    if isinstance(holiday_names, str):
-        holiday_names = [holiday_names]
+    raw_values: list[str] = []
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            raw_values.extend(split_holiday_names(item))
+    else:
+        raw_values.extend(str(value).split(";"))
 
     seen: set[str] = set()
     cleaned: list[str] = []
-    for holiday_name in holiday_names:
-        formatted_name = format_holiday_name(holiday_name)
+    for raw_value in raw_values:
+        formatted_name = format_holiday_name(raw_value)
         normalized_name = normalize_text(formatted_name)
-        if normalized_name in seen:
+        if not formatted_name or normalized_name in seen:
             continue
         seen.add(normalized_name)
         cleaned.append(formatted_name)
@@ -496,29 +547,86 @@ def get_today_holidays(country_code: str) -> list[str]:
     return cleaned
 
 
-def get_next_holiday(country_code: str):
-    today = get_country_today(country_code)
+def get_supplemental_holidays(country_code: str, years: list[int]) -> list[tuple[date, str]]:
+    entries: list[tuple[date, str]] = []
+
+    for year in years:
+        for month, day in SUPPLEMENTAL_HOLIDAYS.get("*", {}):
+            for name in SUPPLEMENTAL_HOLIDAYS["*"][(month, day)]:
+                entries.append((date(year, month, day), name))
+
+        for month, day in SUPPLEMENTAL_HOLIDAYS.get(country_code, {}):
+            for name in SUPPLEMENTAL_HOLIDAYS[country_code][(month, day)]:
+                entries.append((date(year, month, day), name))
+
+    return entries
+
+
+def get_country_holiday_entries(country_code: str, years: list[int]) -> list[tuple[date, str]]:
+    entries: list[tuple[date, str]] = []
 
     try:
-        calendar = get_country_calendar(country_code, [today.year, today.year + 1])
+        calendar = get_country_calendar(country_code, years)
     except Exception:
-        logger.exception("Could not load upcoming holiday calendar for %s", country_code)
-        return None
+        logger.exception("Could not load holiday calendar for %s", country_code)
+        calendar = None
 
-    seen: set[str] = set()
-    for holiday_date, holiday_name in sorted(calendar.items()):
-        if holiday_date <= today:
+    if calendar is not None:
+        for holiday_date, holiday_name in sorted(calendar.items()):
+            for parsed_name in split_holiday_names(holiday_name):
+                entries.append((holiday_date, parsed_name))
+
+    entries.extend(get_supplemental_holidays(country_code, years))
+
+    deduped: list[tuple[date, str]] = []
+    seen: set[tuple[date, str]] = set()
+    for holiday_date, holiday_name in sorted(entries):
+        key = (holiday_date, normalize_text(holiday_name))
+        if key in seen:
             continue
+        seen.add(key)
+        deduped.append((holiday_date, holiday_name))
 
-        formatted_name = format_holiday_name(holiday_name)
-        normalized_name = normalize_text(formatted_name)
-        if normalized_name in seen:
+    return deduped
+
+
+def get_today_holidays(country_code: str) -> list[str]:
+    today = get_country_today(country_code)
+    holiday_names: list[str] = []
+
+    for holiday_date, holiday_name in get_country_holiday_entries(country_code, [today.year]):
+        if holiday_date == today:
+            holiday_names.append(holiday_name)
+
+    return holiday_names
+
+
+def get_upcoming_holidays(country_code: str, *, limit: int) -> list[tuple[date, str]]:
+    today = get_country_today(country_code)
+    upcoming: list[tuple[date, str]] = []
+
+    for holiday_date, holiday_name in get_country_holiday_entries(country_code, [today.year, today.year + 1]):
+        if holiday_date < today:
             continue
+        upcoming.append((holiday_date, holiday_name))
+        if len(upcoming) >= limit:
+            break
 
-        seen.add(normalized_name)
-        return holiday_date, formatted_name
+    return upcoming
 
-    return None
+
+def build_country_holiday_lines(country_code: str, *, limit: int) -> list[str]:
+    country = COUNTRY_INFO[country_code]
+    today = get_country_today(country_code)
+    lines: list[str] = []
+
+    for holiday_date, holiday_name in get_upcoming_holidays(country_code, limit=limit):
+        if holiday_date == today:
+            lines.append(f"{country['flag']} Today: {holiday_name}")
+        else:
+            lines.append(f"{country['flag']} {holiday_date.strftime('%b %d')}: {holiday_name}")
+
+    return lines
 
 
 def build_region_holiday_lines(locations: list[dict[str, str]]) -> list[str]:
@@ -531,29 +639,15 @@ def build_region_holiday_lines(locations: list[dict[str, str]]) -> list[str]:
             continue
 
         seen_country_codes.add(country_code)
-        country = COUNTRY_INFO[country_code]
-        today_holidays = get_today_holidays(country_code)
-        if today_holidays:
-            lines.append(f"{country['flag']} Today: {' / '.join(today_holidays)}")
-            continue
-
-        next_holiday = get_next_holiday(country_code)
-        if next_holiday:
-            holiday_date, holiday_name = next_holiday
-            lines.append(f"{country['flag']} Next: {holiday_date.strftime('%b %d')} {holiday_name}")
+        lines.extend(build_country_holiday_lines(country_code, limit=HOLIDAY_PREVIEW_COUNT))
 
     return lines
 
 
 def build_country_holiday_value(country_code: str) -> str:
-    today_holidays = get_today_holidays(country_code)
-    if today_holidays:
-        return "Today: " + " / ".join(today_holidays)
-
-    next_holiday = get_next_holiday(country_code)
-    if next_holiday:
-        holiday_date, holiday_name = next_holiday
-        return f"Next: {holiday_date.strftime('%b %d')} {holiday_name}"
+    lines = build_country_holiday_lines(country_code, limit=HOLIDAY_COMMAND_LIMIT)
+    if lines:
+        return "\n".join(lines)
 
     return "No holiday data available."
 
@@ -1430,7 +1524,7 @@ def build_fast_reads_block(snapshot: dict[str, Any]) -> str:
 def build_embed() -> discord.Embed:
     embed = discord.Embed(
         title=EMBED_TITLE,
-        description="Live global time desk with world holidays\n🟢 prime • 🟡 shoulder • 🌙 late • 🟣 weekend",
+        description="Live global time desk with world holidays in English\n🟢 prime • 🟡 shoulder • 🌙 late • 🟣 weekend",
         color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
     )
@@ -1537,8 +1631,34 @@ async def time_command(ctx: commands.Context, *, location: str):
         inline=True,
     )
     embed.add_field(
-        name="Holiday",
+        name="Upcoming Holidays",
         value=build_country_holiday_value(location_data["country_code"]),
+        inline=False,
+    )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="holidays", aliases=["holiday"])
+async def holidays_command(ctx: commands.Context, *, location: str):
+    country_code = resolve_country_query(location)
+
+    if not country_code:
+        await ctx.send(
+            "Country not found. Try a country like USA, Japan, India, Australia, or a city already on the desk."
+        )
+        return
+
+    country = COUNTRY_INFO[country_code]
+    embed = discord.Embed(
+        title=f"Holidays in {country['name']}",
+        description="Upcoming holidays in English",
+        color=discord.Color.gold(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Upcoming",
+        value=build_country_holiday_value(country_code),
         inline=False,
     )
 
