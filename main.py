@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
+import holidays
 from discord.ext import commands, tasks
 
 
@@ -76,20 +77,20 @@ PREFERRED_QUOTES = {"SOL", "USDC", "USDT"}
 
 TIMEZONES = {
     "USA": [
-        {"city": "New York", "tz": "America/New_York"},
-        {"city": "Phoenix", "tz": "America/Phoenix"},
+        {"city": "New York", "tz": "America/New_York", "country_code": "US"},
+        {"city": "Phoenix", "tz": "America/Phoenix", "country_code": "US"},
     ],
     "Europe": [
-        {"city": "London", "tz": "Europe/London"},
-        {"city": "Paris", "tz": "Europe/Paris"},
+        {"city": "London", "tz": "Europe/London", "country_code": "GB"},
+        {"city": "Paris", "tz": "Europe/Paris", "country_code": "FR"},
     ],
     "Asia": [
-        {"city": "Tokyo", "tz": "Asia/Tokyo"},
-        {"city": "Dubai", "tz": "Asia/Dubai"},
-        {"city": "India", "tz": "Asia/Kolkata"},
+        {"city": "Tokyo", "tz": "Asia/Tokyo", "country_code": "JP"},
+        {"city": "Dubai", "tz": "Asia/Dubai", "country_code": "AE"},
+        {"city": "India", "tz": "Asia/Kolkata", "country_code": "IN"},
     ],
     "Australia": [
-        {"city": "Sydney", "tz": "Australia/Sydney"},
+        {"city": "Sydney", "tz": "Australia/Sydney", "country_code": "AU"},
     ],
 }
 
@@ -98,6 +99,16 @@ REGION_LABELS = {
     "Europe": "🇪🇺 Europe",
     "Asia": "🌏 Asia",
     "Australia": "🇦🇺 Australia",
+}
+
+COUNTRY_INFO = {
+    "US": {"flag": "🇺🇸", "name": "United States", "reference_tz": "America/New_York"},
+    "GB": {"flag": "🇬🇧", "name": "United Kingdom", "reference_tz": "Europe/London"},
+    "FR": {"flag": "🇫🇷", "name": "France", "reference_tz": "Europe/Paris"},
+    "JP": {"flag": "🇯🇵", "name": "Japan", "reference_tz": "Asia/Tokyo"},
+    "AE": {"flag": "🇦🇪", "name": "United Arab Emirates", "reference_tz": "Asia/Dubai"},
+    "IN": {"flag": "🇮🇳", "name": "India", "reference_tz": "Asia/Kolkata"},
+    "AU": {"flag": "🇦🇺", "name": "Australia", "reference_tz": "Australia/Sydney"},
 }
 
 if not TOKEN:
@@ -428,13 +439,123 @@ def build_clock_block(locations: list[dict[str, str]], reference_now: datetime) 
     return "\n".join(lines)
 
 
+def format_holiday_name(name: Any) -> str:
+    if isinstance(name, (list, tuple, set)):
+        name = " / ".join(str(part) for part in name)
+
+    text = str(name)
+    text = text.replace(" (Observed)", "").replace(" (observed)", "")
+    text = text.replace(" (Estimated)", "").replace(" (estimated)", "")
+    return " ".join(text.split())
+
+
+def get_country_today(country_code: str):
+    return datetime.now(ZoneInfo(COUNTRY_INFO[country_code]["reference_tz"])).date()
+
+
+def get_today_holidays(country_code: str) -> list[str]:
+    today = get_country_today(country_code)
+
+    try:
+        calendar = holidays.country_holidays(country_code, years=[today.year])
+    except Exception:
+        logger.exception("Could not load holiday calendar for %s", country_code)
+        return []
+
+    holiday_names = calendar.get(today)
+    if not holiday_names:
+        return []
+
+    if isinstance(holiday_names, str):
+        holiday_names = [holiday_names]
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for holiday_name in holiday_names:
+        formatted_name = format_holiday_name(holiday_name)
+        normalized_name = normalize_text(formatted_name)
+        if normalized_name in seen:
+            continue
+        seen.add(normalized_name)
+        cleaned.append(formatted_name)
+
+    return cleaned
+
+
+def get_next_holiday(country_code: str):
+    today = get_country_today(country_code)
+
+    try:
+        calendar = holidays.country_holidays(country_code, years=[today.year, today.year + 1])
+    except Exception:
+        logger.exception("Could not load upcoming holiday calendar for %s", country_code)
+        return None
+
+    seen: set[str] = set()
+    for holiday_date, holiday_name in sorted(calendar.items()):
+        if holiday_date <= today:
+            continue
+
+        formatted_name = format_holiday_name(holiday_name)
+        normalized_name = normalize_text(formatted_name)
+        if normalized_name in seen:
+            continue
+
+        seen.add(normalized_name)
+        return holiday_date, formatted_name
+
+    return None
+
+
+def build_region_holiday_lines(locations: list[dict[str, str]]) -> list[str]:
+    lines = []
+    seen_country_codes: set[str] = set()
+
+    for location in locations:
+        country_code = location["country_code"]
+        if country_code in seen_country_codes:
+            continue
+
+        seen_country_codes.add(country_code)
+        country = COUNTRY_INFO[country_code]
+        today_holidays = get_today_holidays(country_code)
+        if today_holidays:
+            lines.append(f"{country['flag']} Today: {' / '.join(today_holidays)}")
+            continue
+
+        next_holiday = get_next_holiday(country_code)
+        if next_holiday:
+            holiday_date, holiday_name = next_holiday
+            lines.append(f"{country['flag']} Next: {holiday_date.strftime('%b %d')} {holiday_name}")
+
+    return lines
+
+
+def build_country_holiday_value(country_code: str) -> str:
+    today_holidays = get_today_holidays(country_code)
+    if today_holidays:
+        return "Today: " + " / ".join(today_holidays)
+
+    next_holiday = get_next_holiday(country_code)
+    if next_holiday:
+        holiday_date, holiday_name = next_holiday
+        return f"Next: {holiday_date.strftime('%b %d')} {holiday_name}"
+
+    return "No holiday data available."
+
+
 def build_clock_fields(embed: discord.Embed) -> None:
     reference_now = datetime.now(ZoneInfo(REFERENCE_TZ_NAME))
 
     for region, locations in TIMEZONES.items():
+        block = build_clock_block(locations, reference_now)
+        holiday_lines = build_region_holiday_lines(locations)
+        if holiday_lines:
+            block = f"{block}\n\n" + "\n".join(holiday_lines)
+
         embed.add_field(
             name=REGION_LABELS.get(region, region),
-            value=build_clock_block(locations, reference_now),
+            value=block,
             inline=False,
         )
 
@@ -1295,7 +1416,7 @@ def build_fast_reads_block(snapshot: dict[str, Any]) -> str:
 def build_embed() -> discord.Embed:
     embed = discord.Embed(
         title=EMBED_TITLE,
-        description="Live global time desk\n🟢 prime • 🟡 shoulder • 🌙 late • 🟣 weekend",
+        description="Live global time desk with world holidays\n🟢 prime • 🟡 shoulder • 🌙 late • 🟣 weekend",
         color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
     )
@@ -1400,6 +1521,11 @@ async def time_command(ctx: commands.Context, *, location: str):
         name="Session",
         value=f"{get_city_status_emoji(now)} {get_city_session_label(now)}",
         inline=True,
+    )
+    embed.add_field(
+        name="Holiday",
+        value=build_country_holiday_value(location_data["country_code"]),
+        inline=False,
     )
 
     await ctx.send(embed=embed)
