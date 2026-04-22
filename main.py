@@ -6,7 +6,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
@@ -49,8 +49,6 @@ MAX_DISPLAY_TOKENS = 5
 MIN_DISPLAY_SCORE = 28
 ACTIVE_TOKEN_SCORE = 45
 HOT_TOKEN_SCORE = 60
-HOLIDAY_PREVIEW_COUNT = max(1, min(6, read_int_env("HOLIDAY_PREVIEW_COUNT", default=3)))
-HOLIDAY_COMMAND_LIMIT = max(HOLIDAY_PREVIEW_COUNT, min(20, read_int_env("HOLIDAY_COMMAND_LIMIT", default=12)))
 HOLIDAY_LANGUAGE = "en_US"
 EMBED_TITLE = "Global Desk"
 LEGACY_EMBED_TITLES = {EMBED_TITLE, "Global Meme Desk", "Meme Market Watch", "World Clock"}
@@ -590,41 +588,29 @@ def get_country_holiday_entries(country_code: str, years: list[int]) -> list[tup
     return deduped
 
 
-def get_today_holidays(country_code: str) -> list[str]:
+def get_country_holiday_window(country_code: str) -> dict[str, list[str]]:
     today = get_country_today(country_code)
-    holiday_names: list[str] = []
+    tomorrow = today + timedelta(days=1)
+    grouped = {"Today": [], "Tomorrow": []}
 
-    for holiday_date, holiday_name in get_country_holiday_entries(country_code, [today.year]):
+    for holiday_date, holiday_name in get_country_holiday_entries(country_code, [today.year, tomorrow.year]):
         if holiday_date == today:
-            holiday_names.append(holiday_name)
+            grouped["Today"].append(holiday_name)
+        elif holiday_date == tomorrow:
+            grouped["Tomorrow"].append(holiday_name)
 
-    return holiday_names
-
-
-def get_upcoming_holidays(country_code: str, *, limit: int) -> list[tuple[date, str]]:
-    today = get_country_today(country_code)
-    upcoming: list[tuple[date, str]] = []
-
-    for holiday_date, holiday_name in get_country_holiday_entries(country_code, [today.year, today.year + 1]):
-        if holiday_date < today:
-            continue
-        upcoming.append((holiday_date, holiday_name))
-        if len(upcoming) >= limit:
-            break
-
-    return upcoming
+    return {label: names for label, names in grouped.items() if names}
 
 
-def build_country_holiday_lines(country_code: str, *, limit: int) -> list[str]:
+def build_country_holiday_lines(country_code: str) -> list[str]:
     country = COUNTRY_INFO[country_code]
-    today = get_country_today(country_code)
     lines: list[str] = []
+    holiday_window = get_country_holiday_window(country_code)
 
-    for holiday_date, holiday_name in get_upcoming_holidays(country_code, limit=limit):
-        if holiday_date == today:
-            lines.append(f"{country['flag']} Today: {holiday_name}")
-        else:
-            lines.append(f"{country['flag']} {holiday_date.strftime('%b %d')}: {holiday_name}")
+    for label in ("Today", "Tomorrow"):
+        holiday_names = holiday_window.get(label)
+        if holiday_names:
+            lines.append(f"{country['flag']} {label}: {' / '.join(holiday_names)}")
 
     return lines
 
@@ -639,17 +625,17 @@ def build_region_holiday_lines(locations: list[dict[str, str]]) -> list[str]:
             continue
 
         seen_country_codes.add(country_code)
-        lines.extend(build_country_holiday_lines(country_code, limit=HOLIDAY_PREVIEW_COUNT))
+        lines.extend(build_country_holiday_lines(country_code))
 
     return lines
 
 
 def build_country_holiday_value(country_code: str) -> str:
-    lines = build_country_holiday_lines(country_code, limit=HOLIDAY_COMMAND_LIMIT)
+    lines = build_country_holiday_lines(country_code)
     if lines:
         return "\n".join(lines)
 
-    return "No holiday data available."
+    return "No holidays today or tomorrow."
 
 
 def build_clock_fields(embed: discord.Embed) -> None:
@@ -1524,7 +1510,7 @@ def build_fast_reads_block(snapshot: dict[str, Any]) -> str:
 def build_embed() -> discord.Embed:
     embed = discord.Embed(
         title=EMBED_TITLE,
-        description="Live global time desk with world holidays in English\n🟢 prime • 🟡 shoulder • 🌙 late • 🟣 weekend",
+        description="Live global time desk with today + tomorrow holidays in English\n🟢 prime • 🟡 shoulder • 🌙 late • 🟣 weekend",
         color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
     )
@@ -1631,7 +1617,7 @@ async def time_command(ctx: commands.Context, *, location: str):
         inline=True,
     )
     embed.add_field(
-        name="Upcoming Holidays",
+        name="Today + Tomorrow",
         value=build_country_holiday_value(location_data["country_code"]),
         inline=False,
     )
@@ -1652,12 +1638,12 @@ async def holidays_command(ctx: commands.Context, *, location: str):
     country = COUNTRY_INFO[country_code]
     embed = discord.Embed(
         title=f"Holidays in {country['name']}",
-        description="Upcoming holidays in English",
+        description="Today and tomorrow in English",
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow(),
     )
     embed.add_field(
-        name="Upcoming",
+        name="Holiday Window",
         value=build_country_holiday_value(country_code),
         inline=False,
     )
