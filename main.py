@@ -453,11 +453,25 @@ def get_country_today(country_code: str):
     return datetime.now(ZoneInfo(COUNTRY_INFO[country_code]["reference_tz"])).date()
 
 
+def get_country_calendar(country_code: str, years: list[int]):
+    base_calendar = holidays.country_holidays(country_code, years=years)
+    supported_categories = getattr(base_calendar, "supported_categories", None)
+
+    if supported_categories:
+        return holidays.country_holidays(
+            country_code,
+            years=years,
+            categories=supported_categories,
+        )
+
+    return base_calendar
+
+
 def get_today_holidays(country_code: str) -> list[str]:
     today = get_country_today(country_code)
 
     try:
-        calendar = holidays.country_holidays(country_code, years=[today.year])
+        calendar = get_country_calendar(country_code, [today.year])
     except Exception:
         logger.exception("Could not load holiday calendar for %s", country_code)
         return []
@@ -486,7 +500,7 @@ def get_next_holiday(country_code: str):
     today = get_country_today(country_code)
 
     try:
-        calendar = holidays.country_holidays(country_code, years=[today.year, today.year + 1])
+        calendar = get_country_calendar(country_code, [today.year, today.year + 1])
     except Exception:
         logger.exception("Could not load upcoming holiday calendar for %s", country_code)
         return None
