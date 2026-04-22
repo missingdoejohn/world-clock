@@ -1,2 +1,4 @@
+aiohttp>=3.9.0
 discord.py==2.7.1
 holidays>=0.47
+python-dotenv>=1.0.0
